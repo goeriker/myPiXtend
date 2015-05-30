@@ -982,7 +982,7 @@ void update_header() {
 	mvwaddstr(win_header, 3, 3, "  / /_/ /  / /   |   /  / __/ / _ \\  / __ \\ / __  / ");
 	mvwaddstr(win_header, 4, 3, " / ____/  / /   /   |  / /_  /  __/ / / / // /_/ /  ");
 	mvwaddstr(win_header, 5, 3, "/_/      /_/   /_/|_|  \\__/  \\___/ /_/ /_/ \\__,_/   ");
-	mvwaddstr(win_header, 6, 5, "PiXtend Auto Tool - V0.4 - http://www.pixtend.de");
+	mvwaddstr(win_header, 6, 5, "PiXtend Auto Tool - V0.4.1 - http://www.pixtend.de");
 	box(win_header, 0, 0);
 	wnoutrefresh(win_header);
 }
@@ -1151,11 +1151,9 @@ void update_DOUT() {
 	for(i = 0; i < 6; i++) {
 		bufCont = field_buffer(field_DOUT[i],0);
 		if(!strcmp(bufCont, "TRUE ")) {
-			mvwprintw(win_DOUT, 4 + 2*i, 25, "ON ");
 			value +=  (1<<i);
 		}
 		if(!strcmp(bufCont, "FALSE")) {
-			mvwprintw(win_DOUT, 4 + 2*i, 25, "OFF");
 		}
 	}
 	OutputData.byDigOut = value;	
@@ -1166,11 +1164,9 @@ void update_DOUT() {
 	for(i = 0; i < 4; i++) {
 		bufCont = field_buffer(field_DOUT[6+i],0);
 		if(!strcmp(bufCont, "TRUE ")) {
-			mvwprintw(win_DOUT, 18 + 2*i, 25, "ON ");
 			value +=  (1<<i);
 		}
 		if(!strcmp(bufCont, "FALSE")) {
-			mvwprintw(win_DOUT, 18 + 2*i, 25, "OFF");
 		}
 	}
 	OutputData.byRelayOut = value;
