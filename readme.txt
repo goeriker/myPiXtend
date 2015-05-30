@@ -90,4 +90,5 @@ Release History:
 0.4 - pxdev: 
 	pixtend: modified auto mode to accept byAux0
 	pxauto: improved UI, added AIN VRef selection to CTRL section, moved status bytes to new STAT section
+0.4.1 - pxauto: minor fixups
 
