@@ -113,4 +113,4 @@ Release History:
 		-added uC Version check before executing newly added functions to allow backward compatibility
 		pxauto:
 		-fixed issue: no more crash if pxauto is executed without root rights or if SPI is not available
-0.5.2 - pixtend: bugfix in case óf new wiringPi version 2.29
+0.5.2 - pixtend: bugfix in case of new wiringPi version 2.29
