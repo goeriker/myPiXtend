@@ -24,6 +24,58 @@
 
 #include "pixtend.h"
 
+/* Module constants */
+#define SPI_FRAME_START         128
+#define SPI_FRAME_END           128
+#define SPI_HANDSHAKE           0b10101010
+#define SPI_CHANNEL_DEFAULT     0
+#define SPI_CHANNEL_DAC         1
+#define SPI_FREQ_V1             100000
+#define SPI_FREQ_V2             700000
+#define PIN_SPI_ENABLE          5
+#define PIN_RESET               4
+#define PIN_SERIAL              1
+
+/* Model identifiers */
+#define MODEL_V2S               83
+#define MODEL_V2L               76
+
+/* CRC configuration */
+#define CRC_INITIAL_VALUE       0xFFFF
+#define CRC_POLYNOMIAL          0xA001
+
+/* Error codes */
+#define ERR_CRC_HEADER          -1
+#define ERR_MODEL_MISMATCH      -2
+#define ERR_CRC_DATA            -3
+
+/* ADC configuration */
+#define ADC_MAX_VALUE           1023
+#define ADC_REF_5V              5.0
+#define ADC_REF_10V             10.0
+#define ADC_SCALE_5V            (ADC_REF_5V / ADC_MAX_VALUE)
+#define ADC_SCALE_10V           (ADC_REF_10V / ADC_MAX_VALUE)
+#define ADC_AI2_AI3_SCALE       0.024194115990990990990990990991
+#define ADC_AI4_AI5_SCALE       0.020158400229358
+
+/* DHT sensor types */
+#define DHT_TYPE_DHT11          1
+#define DHT_TYPE_DHT22          0
+
+/* Temperature/ Humidity scaling */
+#define TEMP_HUMID_DIVISOR      10.0
+#define DHT11_DIVISOR           256.0
+
+/* Bit masks for jumper settings */
+#define JUMPER_CH0_10V          0b00000001
+#define JUMPER_CH1_10V          0b00000010
+#define JUMPER_CH2_10V          0b00000100
+#define JUMPER_CH3_10V          0b00001000
+
+/* Negative temperature bit mask for DHT22 */
+#define TEMP_NEGATIVE_BIT       15
+
+/* Module state */
 static uint8_t byAux0;
 static uint8_t byJumper10V;
 static uint8_t byInitFlag = 0;
@@ -36,7 +88,7 @@ uint16_t crc16_calc(uint16_t crc, uint8_t data)
 	{
 		if (crc & 1)
 		{
-			crc = (crc >> 1) ^ 0xA001;
+			crc = (crc >> 1) ^ CRC_POLYNOMIAL;
 		}
 		else
 		{
@@ -44,6 +96,44 @@ uint16_t crc16_calc(uint16_t crc, uint8_t data)
 		}
 	}
 	return crc;
+}
+
+/* Helper functions for SPI data manipulation */
+static inline void spi_write_u16_le(unsigned char *buf, int idx, uint16_t value)
+{
+	buf[idx] = value & 0xFF;
+	buf[idx + 1] = (value >> 8) & 0xFF;
+}
+
+static inline uint16_t spi_read_u16_le(const unsigned char *buf, int idx)
+{
+	return (uint16_t)(buf[idx + 1] << 8) | buf[idx];
+}
+
+static inline float scale_adc_value(uint16_t value, int is_10v_mode)
+{
+	float scale = is_10v_mode ? ADC_SCALE_10V : ADC_SCALE_5V;
+	return (float)value * scale;
+}
+
+static inline float scale_temp_humid(uint16_t value)
+{
+	return (float)value / TEMP_HUMID_DIVISOR;
+}
+
+static inline float scale_dht11(uint16_t value)
+{
+	return (float)value / DHT11_DIVISOR;
+}
+
+static inline int is_negative_temp_dht22(uint16_t temp_value)
+{
+	return (temp_value >> TEMP_NEGATIVE_BIT) & 1;
+}
+
+static inline uint16_t clear_negative_bit(uint16_t temp_value)
+{
+	return temp_value & ~(1 << TEMP_NEGATIVE_BIT);
 }
 
 int Spi_AutoModeDAC(struct pixtOutDAC *OutputDataDAC) {
