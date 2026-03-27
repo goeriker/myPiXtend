@@ -1,0 +1,35 @@
+```
+# Compiled and binary files
+*.o
+*.obj
+*.out
+
+# Dependencies
+__pycache__/
+*.pyc
+*.pyo
+*.pyd
+
+# Logs and temp files
+*.log
+*.tmp
+*.swp
+
+# Environment
+.env
+.env.local
+*.env.*
+
+# Editors
+.vscode/
+.idea/
+
+# Build artifacts
+build/
+dist/
+*.so
+*.dll
+*.dylib
+*.a
+*.lib
+```

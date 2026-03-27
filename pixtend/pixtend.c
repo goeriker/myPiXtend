@@ -24,6 +24,59 @@
 
 #include "pixtend.h"
 
+/* Module constants */
+#define AUTOMATIC_MODE_FB       128
+#define AUTOMATIC_MODE_SB       255
+#define AUTOMATIC_MODE_LB       128
+#define SPI_HANDSHAKE           0b10101010
+#define SPI_CHANNEL_DEFAULT     0
+#define SPI_CHANNEL_DAC         1
+#define SPI_FREQ_V1             100000
+#define SPI_FREQ_V2             700000
+#define PIN_SPI_ENABLE          5
+#define PIN_RESET               4
+#define PIN_SERIAL              1
+
+/* Model identifiers */
+#define MODEL_V2S               83
+#define MODEL_V2L               76
+
+/* CRC configuration */
+#define CRC_INITIAL_VALUE       0xFFFF
+#define CRC_POLYNOMIAL          0xA001
+
+/* Error codes */
+#define ERR_CRC_HEADER          -1
+#define ERR_MODEL_MISMATCH      -2
+#define ERR_CRC_DATA            -3
+
+/* ADC configuration */
+#define ADC_MAX_VALUE           1023
+#define ADC_REF_5V              5.0
+#define ADC_REF_10V             10.0
+#define ADC_SCALE_5V            (ADC_REF_5V / ADC_MAX_VALUE)
+#define ADC_SCALE_10V           (ADC_REF_10V / ADC_MAX_VALUE)
+#define ADC_AI2_AI3_SCALE       0.024194115990990990990990990991
+#define ADC_AI4_AI5_SCALE       0.020158400229358
+
+/* DHT sensor types */
+#define DHT_TYPE_DHT11          1
+#define DHT_TYPE_DHT22          0
+
+/* Temperature/ Humidity scaling */
+#define TEMP_HUMID_DIVISOR      10.0
+#define DHT11_DIVISOR           256.0
+
+/* Bit masks for jumper settings */
+#define JUMPER_CH0_10V          0b00000001
+#define JUMPER_CH1_10V          0b00000010
+#define JUMPER_CH2_10V          0b00000100
+#define JUMPER_CH3_10V          0b00001000
+
+/* Negative temperature bit mask for DHT22 */
+#define TEMP_NEGATIVE_BIT       15
+
+/* Module state */
 static uint8_t byAux0;
 static uint8_t byJumper10V;
 static uint8_t byInitFlag = 0;
@@ -36,7 +89,7 @@ uint16_t crc16_calc(uint16_t crc, uint8_t data)
 	{
 		if (crc & 1)
 		{
-			crc = (crc >> 1) ^ 0xA001;
+			crc = (crc >> 1) ^ CRC_POLYNOMIAL;
 		}
 		else
 		{
@@ -44,6 +97,116 @@ uint16_t crc16_calc(uint16_t crc, uint8_t data)
 		}
 	}
 	return crc;
+}
+
+/* Helper functions for SPI data manipulation */
+static inline void spi_write_u16_le(unsigned char *buf, int idx, uint16_t value)
+{
+	buf[idx] = value & 0xFF;
+	buf[idx + 1] = (value >> 8) & 0xFF;
+}
+
+static inline uint16_t spi_read_u16_le(const unsigned char *buf, int idx)
+{
+	return (uint16_t)(buf[idx + 1] << 8) | buf[idx];
+}
+
+static inline float scale_adc_value(uint16_t value, int is_10v_mode)
+{
+	float scale = is_10v_mode ? ADC_SCALE_10V : ADC_SCALE_5V;
+	return (float)value * scale;
+}
+
+static inline float scale_temp_humid(uint16_t value)
+{
+	return (float)value / TEMP_HUMID_DIVISOR;
+}
+
+static inline float scale_dht11(uint16_t value)
+{
+	return (float)value / DHT11_DIVISOR;
+}
+
+static inline int is_negative_temp_dht22(uint16_t temp_value)
+{
+	return (temp_value >> TEMP_NEGATIVE_BIT) & 1;
+}
+
+static inline uint16_t clear_negative_bit(uint16_t temp_value)
+{
+	return temp_value & ~(1 << TEMP_NEGATIVE_BIT);
+}
+
+/* CRC calculation helper for transmit and receive verification */
+static inline uint16_t calculate_crc_range(const unsigned char *buf, int start, int end)
+{
+	uint16_t crc = CRC_INITIAL_VALUE;
+	for (int i = start; i <= end; i++)
+	{
+		crc = crc16_calc(crc, buf[i]);
+	}
+	return crc;
+}
+
+/* Write CRC bytes to buffer */
+static inline void write_crc_to_buffer(unsigned char *buf, int low_idx, int high_idx, uint16_t crc)
+{
+	buf[low_idx] = crc & 0xFF;
+	buf[high_idx] = crc >> 8;
+}
+
+/* Verify received CRC against calculated CRC */
+static inline int verify_crc(const unsigned char *buf, int low_idx, int high_idx, int start, int end)
+{
+	uint16_t crc_rx = (uint16_t)(buf[high_idx] << 8) | buf[low_idx];
+	uint16_t crc_calc = calculate_crc_range(buf, start, end);
+	return (crc_rx == crc_calc) ? 0 : -1;
+}
+
+/* Read 16-bit value from SPI buffer with error check for 0xFFFF (255,255) */
+static inline int read_spi_word_with_error_check(const unsigned char *buf, 
+						   int temp_idx, int humid_idx,
+						   uint16_t *temp_out, uint16_t *humid_out)
+{
+	if (buf[temp_idx] == 255 && buf[temp_idx - 1] == 255 && 
+	    buf[humid_idx] == 255 && buf[humid_idx - 1] == 255)
+	{
+		return 1; /* Error condition */
+	}
+	*temp_out = spi_read_u16_le(buf, temp_idx - 1);
+	*humid_out = spi_read_u16_le(buf, humid_idx - 1);
+	return 0; /* Success */
+}
+
+/* Process temperature/humidity data for a single channel */
+static inline void process_temp_humid_channel(uint16_t w_temp, uint16_t w_humid, 
+						int is_dht11, float *r_temp, float *r_humid)
+{
+	if (is_dht11)
+	{
+		*r_temp = scale_dht11(w_temp);
+		*r_humid = scale_dht11(w_humid);
+	}
+	else
+	{
+		/* DHT22: check for negative temperature */
+		if (is_negative_temp_dht22(w_temp))
+		{
+			w_temp = clear_negative_bit(w_temp);
+			*r_temp = scale_temp_humid(w_temp) * -1.0f;
+		}
+		else
+		{
+			*r_temp = scale_temp_humid(w_temp);
+		}
+		*r_humid = scale_temp_humid(w_humid);
+	}
+}
+
+/* Scale analog input based on jumper setting */
+static inline float scale_analog_input(uint16_t value, int is_10v_mode)
+{
+	return scale_adc_value(value, is_10v_mode);
 }
 
 int Spi_AutoModeDAC(struct pixtOutDAC *OutputDataDAC) {
@@ -56,22 +219,18 @@ int Spi_AutoModeDAC(struct pixtOutDAC *OutputDataDAC) {
 
 int Spi_AutoMode(struct pixtOut *OutputData, struct pixtIn *InputData)
 {
-	uint16_t crcSum;
-	uint16_t crcSumRx;
-	int i;
 	unsigned char spi_output[34];
 	int spi_device = 0;
 	int len = 34;
+	uint16_t crcSum;
 	
-	spi_output[0] = 128;                                
-	spi_output[1] = 255;                                
+	spi_output[0] = AUTOMATIC_MODE_FB;                                
+	spi_output[1] = AUTOMATIC_MODE_SB;                                
 	spi_output[2] = OutputData->byDigOut;                           
 	spi_output[3] = OutputData->byRelayOut;                         
-	spi_output[4] = OutputData->byGpioOut;                           
-	spi_output[5] = (uint8_t)(OutputData->wPwm0 & 0xFF);       
-	spi_output[6] = (uint8_t)((OutputData->wPwm0>>8) & 0xFF);
-	spi_output[7] = (uint8_t)(OutputData->wPwm1 & 0xFF);       
-	spi_output[8] = (uint8_t)((OutputData->wPwm1>>8) & 0xFF);
+	spi_output[4] = OutputData->byGpioOut;                          
+	spi_write_u16_le(spi_output, 5, OutputData->wPwm0);
+	spi_write_u16_le(spi_output, 7, OutputData->wPwm1);
 	spi_output[9] = OutputData->byPwm0Ctrl0;                         
 	spi_output[10] = OutputData->byPwm0Ctrl1;
 	spi_output[11] = OutputData->byPwm0Ctrl2;
@@ -81,100 +240,74 @@ int Spi_AutoMode(struct pixtOut *OutputData, struct pixtIn *InputData)
 	spi_output[15] = OutputData->byAiCtrl1;                          
 	spi_output[16] = OutputData->byPiStatus;                         
 	byAux0 = OutputData->byAux0;
-	//Calculate CRC16 Transmit Checksum
-	crcSum = 0xFFFF;
-	for (i=2; i <= 30; i++) 
-	{
-		crcSum = crc16_calc(crcSum, spi_output[i]);
-	}
-	spi_output[31]=crcSum & 0xFF;	//CRC Low Byte
-	spi_output[32]=crcSum >> 8;	//CRC High Byte
-	spi_output[33] = 128;   //Termination
 	
-	//Initialise SPI Data Transfer with OutputData
+	/* Calculate and write CRC16 Transmit Checksum */
+	crcSum = calculate_crc_range(spi_output, 2, 30);
+	write_crc_to_buffer(spi_output, 31, 32, crcSum);
+	spi_output[33] = AUTOMATIC_MODE_LB;   /* Termination */
+	
+	/* Initialise SPI Data Transfer with OutputData */
 	wiringPiSPIDataRW(spi_device, spi_output, len);
 	
-	//spi_output now contains all returned data, assign values to InputData
-	InputData->byDigIn =spi_output[2];
-	InputData->wAi0 = (uint16_t)(spi_output[4]<<8)|(spi_output[3]);
-	InputData->wAi1 = (uint16_t)(spi_output[6]<<8)|(spi_output[5]);
-	InputData->wAi2 = (uint16_t)(spi_output[8]<<8)|(spi_output[7]);
-	InputData->wAi3 = (uint16_t)(spi_output[10]<<8)|(spi_output[9]);
+	/* spi_output now contains all returned data, assign values to InputData */
+	InputData->byDigIn = spi_output[2];
+	InputData->wAi0 = spi_read_u16_le(spi_output, 3);
+	InputData->wAi1 = spi_read_u16_le(spi_output, 5);
+	InputData->wAi2 = spi_read_u16_le(spi_output, 7);
+	InputData->wAi3 = spi_read_u16_le(spi_output, 9);
 	InputData->byGpioIn = spi_output[11];
-	InputData->wTemp0 = (uint16_t)(spi_output[13]<<8)|(spi_output[12]);
-	InputData->wTemp1 = (uint16_t)(spi_output[15]<<8)|(spi_output[14]);
-	InputData->wTemp2 = (uint16_t)(spi_output[17]<<8)|(spi_output[16]);
-	InputData->wTemp3 = (uint16_t)(spi_output[19]<<8)|(spi_output[18]);
-	InputData->wHumid0 = (uint16_t)(spi_output[21]<<8)|(spi_output[20]);
-	InputData->wHumid1 = (uint16_t)(spi_output[23]<<8)|(spi_output[22]);
-	InputData->wHumid2 = (uint16_t)(spi_output[25]<<8)|(spi_output[24]);
-	InputData->wHumid3 = (uint16_t)(spi_output[27]<<8)|(spi_output[26]);
+	InputData->wTemp0 = spi_read_u16_le(spi_output, 12);
+	InputData->wTemp1 = spi_read_u16_le(spi_output, 14);
+	InputData->wTemp2 = spi_read_u16_le(spi_output, 16);
+	InputData->wTemp3 = spi_read_u16_le(spi_output, 18);
+	InputData->wHumid0 = spi_read_u16_le(spi_output, 20);
+	InputData->wHumid1 = spi_read_u16_le(spi_output, 22);
+	InputData->wHumid2 = spi_read_u16_le(spi_output, 24);
+	InputData->wHumid3 = spi_read_u16_le(spi_output, 26);
 	InputData->byUcVersionL = spi_output[28];
 	InputData->byUcVersionH = spi_output[29];
 	InputData->byUcStatus = spi_output[30];
 	
-	if (byAux0 & (0b00000001)) {
-		InputData->rAi0 = (float)(InputData->wAi0) * (10.0 / 1024);
-	} 
-	else {
-		InputData->rAi0 = (float)(InputData->wAi0) * (5.0 / 1024);
-	}
-	if (byAux0 & (0b00000010)) {
-		InputData->rAi1 = (float)(InputData->wAi1) * (10.0 / 1024);
-	} 
-	else {
-		InputData->rAi1 = (float)(InputData->wAi1) * (5.0 / 1024);
-	}
+	/* Scale analog inputs based on jumper settings */
+	InputData->rAi0 = scale_analog_input(InputData->wAi0, byAux0 & JUMPER_CH0_10V);
+	InputData->rAi1 = scale_analog_input(InputData->wAi1, byAux0 & JUMPER_CH1_10V);
+	InputData->rAi2 = (float)(InputData->wAi2) * ADC_AI2_AI3_SCALE;
+	InputData->rAi3 = (float)(InputData->wAi3) * ADC_AI2_AI3_SCALE;
 	
-	InputData->rAi2 = (float)(InputData->wAi2) * 0.024194115990990990990990990991;
-	InputData->rAi3 = (float)(InputData->wAi3) * 0.024194115990990990990990990991;
-	InputData->rTemp0 = (float)(InputData->wTemp0) / 10.0;
-	InputData->rTemp1 = (float)(InputData->wTemp1) / 10.0;
-	InputData->rTemp2 = (float)(InputData->wTemp2) / 10.0;
-	InputData->rTemp3 = (float)(InputData->wTemp3) / 10.0;
-	InputData->rHumid0 = (float)(InputData->wHumid0) / 10.0;
-	InputData->rHumid1 = (float)(InputData->wHumid1) / 10.0;
-	InputData->rHumid2 = (float)(InputData->wHumid2) / 10.0;
-	InputData->rHumid3 = (float)(InputData->wHumid3) / 10.0;
+	/* Scale temperature and humidity values */
+	InputData->rTemp0 = scale_temp_humid(InputData->wTemp0);
+	InputData->rTemp1 = scale_temp_humid(InputData->wTemp1);
+	InputData->rTemp2 = scale_temp_humid(InputData->wTemp2);
+	InputData->rTemp3 = scale_temp_humid(InputData->wTemp3);
+	InputData->rHumid0 = scale_temp_humid(InputData->wHumid0);
+	InputData->rHumid1 = scale_temp_humid(InputData->wHumid1);
+	InputData->rHumid2 = scale_temp_humid(InputData->wHumid2);
+	InputData->rHumid3 = scale_temp_humid(InputData->wHumid3);
 	
-	//Calculate CRC16 Receive Checksum
-	crcSum = 0xFFFF;
-	for (i=2; i <= 30; i++) 
-	{
-		crcSum = crc16_calc(crcSum, spi_output[i]);
-	}
+	/* Verify receive CRC */
+	if (verify_crc(spi_output, 31, 32, 2, 30) != 0)
+		return ERR_CRC_HEADER;
 	
-	crcSumRx = (spi_output[32]<<8) + spi_output[31];
-	
-    if (crcSumRx != crcSum)
-		return -1;
-	else
-		return 0;
+	return 0;
 }
 
 int Spi_AutoModeV2S(struct pixtOutV2S *OutputData, struct pixtInV2S *InputData)
 {
-	uint16_t crcSumHeader;
-	uint16_t crcSumData;
-	uint16_t crcSumHeaderRx;
-	uint16_t crcSumHeaderRxCalc;
-	uint16_t crcSumDataRx;
-	uint16_t crcSumDataRxCalc;
-    uint16_t wTempValue;
-	int i;
 	unsigned char spi_output[67];
 	int spi_device = 0;
 	int len = 67;
+	uint16_t crcSumHeader, crcSumData;
 	
+	/* Build SPI output frame */
 	spi_output[0] = OutputData->byModelOut;                                
 	spi_output[1] = OutputData->byUCMode;
 	spi_output[2] = OutputData->byUCCtrl0;
 	spi_output[3] = OutputData->byUCCtrl1;
-    spi_output[4] = 0; 	//Reserved
-    spi_output[5] = 0; 	//Reserved
-    spi_output[6] = 0; 	//Reserved
-	spi_output[7] = 0; // Reserved for Header CRC value
-	spi_output[8] = 0; // Reserver for Header CRC value
+	spi_output[4] = 0; /* Reserved */
+	spi_output[5] = 0; /* Reserved */
+	spi_output[6] = 0; /* Reserved */
+	spi_output[7] = 0; /* Reserved for Header CRC value */
+	spi_output[8] = 0; /* Reserved for Header CRC value */
 	spi_output[9] = OutputData->byDigitalInDebounce01;
 	spi_output[10] = OutputData->byDigitalInDebounce23;
 	spi_output[11] = OutputData->byDigitalInDebounce45;
@@ -186,230 +319,110 @@ int Spi_AutoModeV2S(struct pixtOutV2S *OutputData, struct pixtInV2S *InputData)
 	spi_output[17] = OutputData->byGPIODebounce01;
 	spi_output[18] = OutputData->byGPIODebounce23;
 	spi_output[19] = OutputData->byPWM0Ctrl0;
-	spi_output[20] = (uint8_t)(OutputData->wPWM0Ctrl1 & 0xFF);
-	spi_output[21] = (uint8_t)((OutputData->wPWM0Ctrl1>>8) & 0xFF);
-	spi_output[22] = (uint8_t)(OutputData->wPWM0A & 0xFF);
-	spi_output[23] = (uint8_t)((OutputData->wPWM0A>>8) & 0xFF);
-	spi_output[24] = (uint8_t)(OutputData->wPWM0B & 0xFF);
-	spi_output[25] = (uint8_t)((OutputData->wPWM0B>>8) & 0xFF);
+	spi_write_u16_le(spi_output, 20, OutputData->wPWM0Ctrl1);
+	spi_write_u16_le(spi_output, 22, OutputData->wPWM0A);
+	spi_write_u16_le(spi_output, 24, OutputData->wPWM0B);
 	spi_output[26] = OutputData->byPWM1Ctrl0;
 	spi_output[27] = OutputData->byPWM1Ctrl1;
-    spi_output[28] = 0; 	//Reserved
+	spi_output[28] = 0; /* Reserved */
 	spi_output[29] = OutputData->byPWM1A;
-    spi_output[30] = 0; 	//Reserved
+	spi_output[30] = 0; /* Reserved */
 	spi_output[31] = OutputData->byPWM1B;
-    spi_output[32] = 0; 	//Reserved
+	spi_output[32] = 0; /* Reserved */
 
-	//Add Retain data to SPI output          
-	for (i=0; i <= 31; i++) 
+	/* Add Retain data to SPI output */
+	for (int i = 0; i <= 31; i++) 
 	{
-		spi_output[33+i] = OutputData->abyRetainDataOut[i];
+		spi_output[33 + i] = OutputData->abyRetainDataOut[i];
 	}
 
-	spi_output[65] = 0; //Reserved for data CRC
-	spi_output[66] = 0; //Reserved for data CRC            
-    //Save physical jumper setting given by user for this call          
+	spi_output[65] = 0; /* Reserved for data CRC */
+	spi_output[66] = 0; /* Reserved for data CRC */
+	
+	/* Save physical jumper setting given by user for this call */
 	byJumper10V = OutputData->byJumper10V;
 
-	//Calculate CRC16 Header Transmit Checksum
-	crcSumHeader = 0xFFFF;
-	for (i=0; i < 7; i++) 
-	{
-		crcSumHeader = crc16_calc(crcSumHeader, spi_output[i]);
-	}
-	spi_output[7]=crcSumHeader & 0xFF;	//CRC Low Byte
-	spi_output[8]=crcSumHeader >> 8;	//CRC High Byte
+	/* Calculate and write CRC16 Header Transmit Checksum */
+	crcSumHeader = calculate_crc_range(spi_output, 0, 6);
+	write_crc_to_buffer(spi_output, 7, 8, crcSumHeader);
 
-	//Calculate CRC16 Data Transmit Checksum
-	crcSumData = 0xFFFF;
-	for (i=9; i < 65; i++) 
-	{
-		crcSumData = crc16_calc(crcSumData, spi_output[i]);
-	}
-	spi_output[65]=crcSumData & 0xFF; //CRC Low Byte
-	spi_output[66]=crcSumData >> 8;	  //CRC High Byte
+	/* Calculate and write CRC16 Data Transmit Checksum */
+	crcSumData = calculate_crc_range(spi_output, 9, 64);
+	write_crc_to_buffer(spi_output, 65, 66, crcSumData);
 	
-	//-------------------------------------------------------------------------
-	//Initialise SPI Data Transfer with OutputData
+	/* Initialise SPI Data Transfer with OutputData */
 	wiringPiSPIDataRW(spi_device, spi_output, len);
-	//-------------------------------------------------------------------------
 
-	//Calculate Header CRC16 Receive Checksum
-	crcSumHeaderRxCalc = 0xFFFF;
-	for (i=0; i <= 6; i++) 
-	{
-		crcSumHeaderRxCalc = crc16_calc(crcSumHeaderRxCalc, spi_output[i]);
-	}
+	/* Verify header CRC */
+	if (verify_crc(spi_output, 7, 8, 0, 6) != 0)
+		return ERR_CRC_HEADER;
 	
-	crcSumHeaderRx = (spi_output[8]<<8) + spi_output[7];
-	
-	//Check that CRC sums match
-    if (crcSumHeaderRx != crcSumHeaderRxCalc)
-		return -1;
-	
-	// Header Data received is OK
-	// spi_output now contains all returned data, assign values to InputData
-
+	/* Read header data */
 	InputData->byFirmware = spi_output[0];
 	InputData->byHardware = spi_output[1];
 	InputData->byModelIn = spi_output[2];
 	InputData->byUCState = spi_output[3];
-    InputData->byUCWarnings = spi_output[4];
-    //spi_output[5]; //Reserved
-    //spi_output[6]; //Reserved
-    //spi_output[7]; //CRC Reserved
-    //spi_output[8]; //CRC Reserved
-    
-    //Check model
- 	if (spi_output[2] != 83)
-		return -2;   
-    
-	//Calculate Data CRC16 Receive Checksum
-	crcSumDataRxCalc = 0xFFFF;
-	for (i=9; i <= 64; i++) 
-	{
-		crcSumDataRxCalc = crc16_calc(crcSumDataRxCalc, spi_output[i]);
-	}
+	InputData->byUCWarnings = spi_output[4];
 	
-	crcSumDataRx = (spi_output[66]<<8) + spi_output[65];
+	/* Check model */
+	if (spi_output[2] != MODEL_V2S)
+		return ERR_MODEL_MISMATCH;
 	
-    //Chekc data crc
-    if (crcSumDataRxCalc != crcSumDataRx)
-		return -3;    
-    
-	InputData->byDigitalIn =spi_output[9];
-	InputData->wAnalogIn0 = (uint16_t)(spi_output[11]<<8)|(spi_output[10]);
-	InputData->wAnalogIn1 = (uint16_t)(spi_output[13]<<8)|(spi_output[12]);
+	/* Verify data CRC */
+	if (verify_crc(spi_output, 65, 66, 9, 64) != 0)
+		return ERR_CRC_DATA;
+	
+	/* Read data fields */
+	InputData->byDigitalIn = spi_output[9];
+	InputData->wAnalogIn0 = spi_read_u16_le(spi_output, 10);
+	InputData->wAnalogIn1 = spi_read_u16_le(spi_output, 12);
 	InputData->byGPIOIn = spi_output[14];
-    //----------------------------------------------------------------------------------------------------
-    //Check Temp0 and Humid0 for value 255, meaning read error
-    if (spi_output[16] == 255 && spi_output[15] == 255 && spi_output[18] == 255 && spi_output[17] == 255){
-        InputData->byTemp0Error = 1;
-    }
-    else{
-        InputData->wTemp0 = (uint16_t)(spi_output[16]<<8)|(spi_output[15]);
-        InputData->wHumid0 = (uint16_t)(spi_output[18]<<8)|(spi_output[17]);
-        InputData->byTemp0Error = 0;
-    }
-    //----------------------------------------------------------------------------------------------------
-    //Check Temp1 and Humid1 for value 255, meaning read error
-     if (spi_output[20] == 255 && spi_output[19] == 255 && spi_output[22] == 255 && spi_output[21] == 255){
-        InputData->byTemp1Error = 1;
-    }
-    else{
-        InputData->wTemp1 = (uint16_t)(spi_output[20]<<8)|(spi_output[19]);
-        InputData->wHumid1 = (uint16_t)(spi_output[22]<<8)|(spi_output[21]);
-        InputData->byTemp1Error = 0;
-    }
-    //----------------------------------------------------------------------------------------------------
-    //Check Temp2 and Humid2 for value 255, meaning read error
-     if (spi_output[24] == 255 && spi_output[23] == 255 && spi_output[26] == 255 && spi_output[25] == 255){
-        InputData->byTemp2Error = 1;
-    }
-    else{
-        InputData->wTemp2 = (uint16_t)(spi_output[24]<<8)|(spi_output[23]);
-        InputData->wHumid2 = (uint16_t)(spi_output[26]<<8)|(spi_output[25]);
-        InputData->byTemp2Error = 0;
-    }
-    //----------------------------------------------------------------------------------------------------
-    //Check Temp3 and Humid3 for value 255, meaning read error
-     if (spi_output[28] == 255 && spi_output[27] == 255 && spi_output[30] == 255 && spi_output[29] == 255){
-        InputData->byTemp3Error = 1;
-    }
-    else{
-        InputData->wTemp3 = (uint16_t)(spi_output[28]<<8)|(spi_output[27]);
-        InputData->wHumid3 = (uint16_t)(spi_output[30]<<8)|(spi_output[29]);
-        InputData->byTemp3Error = 0;
-    }
-    //----------------------------------------------------------------------------------------------------
-    //spi_output[31]; //Reserved
-    //spi_output[32]; //Reserved
-
-	if (byJumper10V & (0b00000001)) {
-		InputData->rAnalogIn0 = (float)(InputData->wAnalogIn0) * (10.0 / 1024);
-	} 
-	else {
-		InputData->rAnalogIn0 = (float)(InputData->wAnalogIn0) * (5.0 / 1024);
-	}
-	if (byJumper10V & (0b00000010)) {
-		InputData->rAnalogIn1 = (float)(InputData->wAnalogIn1) * (10.0 / 1024);
-	} 
-	else {
-		InputData->rAnalogIn1 = (float)(InputData->wAnalogIn1) * (5.0 / 1024);
+	
+	/* Read temperature/humidity with error checking for channels 0-3 */
+	const int temp_indices[] = {16, 20, 24, 28};
+	const int humid_indices[] = {18, 22, 26, 30};
+	uint8_t *error_flags[] = {&InputData->byTemp0Error, &InputData->byTemp1Error, 
+				  &InputData->byTemp2Error, &InputData->byTemp3Error};
+	uint16_t *temp_values[] = {&InputData->wTemp0, &InputData->wTemp1, 
+				   &InputData->wTemp2, &InputData->wTemp3};
+	uint16_t *humid_values[] = {&InputData->wHumid0, &InputData->wHumid1, 
+				    &InputData->wHumid2, &InputData->wHumid3};
+	
+	for (int ch = 0; ch < 4; ch++)
+	{
+		if (read_spi_word_with_error_check(spi_output, temp_indices[ch], humid_indices[ch],
+						   temp_values[ch], humid_values[ch]) != 0)
+		{
+			*error_flags[ch] = 1;
+		}
+		else
+		{
+			*error_flags[ch] = 0;
+		}
 	}
 	
-    //Check if user chose DHT11 or DHT22 sensor at GPIO0, 1 = DHT11 and 0 = DHT22
-    if (OutputData->byGPIO0Dht11 == 1){
-        InputData->rTemp0 = (float)(InputData->wTemp0 / 256);
-        InputData->rHumid0 = (float)(InputData->wHumid0 / 256);
-    }
-    else{
-        //For DHT22 sensors check bit 15, if set temperature value is negative
-        wTempValue = InputData->wTemp0;
-        if ((wTempValue >> 15) & 1) {
-            wTempValue &= ~(1 << 15);
-            InputData->rTemp0 = ((float)(wTempValue) / 10.0) * -1.0;
-        }
-        else {
-            InputData->rTemp0 = (float)(InputData->wTemp0) / 10.0;
-        }
-        InputData->rHumid0 = (float)(InputData->wHumid0) / 10.0;
-    }
-    //Check if user chose DHT11 or DHT22 sensor at GPIO1, 1 = DHT11 and 0 = DHT22
-     if (OutputData->byGPIO1Dht11 == 1){
-        InputData->rTemp1 = (float)(InputData->wTemp1 / 256);
-        InputData->rHumid1 = (float)(InputData->wHumid1 / 256);
-    }
-    else{
-        //For DHT22 sensors check bit 15, if set temperature value is negative
-        wTempValue = InputData->wTemp1;
-        if ((wTempValue >> 15) & 1) {
-            wTempValue &= ~(1 << 15);
-            InputData->rTemp1 = ((float)(wTempValue) / 10.0) * -1.0;
-        }
-        else {
-            InputData->rTemp1 = (float)(InputData->wTemp1) / 10.0;
-        }
-        InputData->rHumid1 = (float)(InputData->wHumid1) / 10.0;
-    }
-    //Check if user chose DHT11 or DHT22 sensor at GPIO2, 1 = DHT11 and 0 = DHT22
-     if (OutputData->byGPIO2Dht11 == 1){
-        InputData->rTemp2 = (float)(InputData->wTemp2 / 256);
-        InputData->rHumid2 = (float)(InputData->wHumid2 / 256);
-    }
-    else{
-        //For DHT22 sensors check bit 15, if set temperature value is negative
-        wTempValue = InputData->wTemp2;
-        if ((wTempValue >> 15) & 1) {
-            wTempValue &= ~(1 << 15);
-            InputData->rTemp2 = ((float)(wTempValue) / 10.0) * -1.0;
-        }
-        else {
-            InputData->rTemp2 = (float)(InputData->wTemp2) / 10.0;
-        }
-        InputData->rHumid2 = (float)(InputData->wHumid2) / 10.0;
-    }
-    //Check if user chose DHT11 or DHT22 sensor at GPIO3, 1 = DHT11 and 0 = DHT22
-     if (OutputData->byGPIO3Dht11 == 1){
-        InputData->rTemp3 = (float)(InputData->wTemp3 / 256);
-        InputData->rHumid3 = (float)(InputData->wHumid3 / 256);
-    }
-    else{
-        //For DHT22 sensors check bit 15, if set temperature value is negative
-        wTempValue = InputData->wTemp3;
-        if ((wTempValue >> 15) & 1) {
-            wTempValue &= ~(1 << 15);
-            InputData->rTemp3 = ((float)(wTempValue) / 10.0) * -1.0;
-        }
-        else {
-            InputData->rTemp3 = (float)(InputData->wTemp3) / 10.0;
-        }
-        InputData->rHumid3 = (float)(InputData->wHumid3) / 10.0;
-    }
-	//Get Retain data from SPI input          
-	for (i=0; i <= 31; i++) 
+	/* Scale analog inputs based on jumper settings */
+	InputData->rAnalogIn0 = scale_analog_input(InputData->wAnalogIn0, byJumper10V & JUMPER_CH0_10V);
+	InputData->rAnalogIn1 = scale_analog_input(InputData->wAnalogIn1, byJumper10V & JUMPER_CH1_10V);
+	
+	/* Process temperature/humidity for all 4 channels */
+	const int dht11_flags[] = {OutputData->byGPIO0Dht11, OutputData->byGPIO1Dht11,
+				   OutputData->byGPIO2Dht11, OutputData->byGPIO3Dht11};
+	float *temp_results[] = {&InputData->rTemp0, &InputData->rTemp1,
+				 &InputData->rTemp2, &InputData->rTemp3};
+	float *humid_results[] = {&InputData->rHumid0, &InputData->rHumid1,
+				  &InputData->rHumid2, &InputData->rHumid3};
+	
+	for (int ch = 0; ch < 4; ch++)
 	{
-		InputData->abyRetainDataIn[i] = spi_output[33+i];
+		process_temp_humid_channel(*temp_values[ch], *humid_values[ch],
+					   dht11_flags[ch], temp_results[ch], humid_results[ch]);
+	}
+	
+	/* Get Retain data from SPI input */
+	for (int i = 0; i <= 31; i++) 
+	{
+		InputData->abyRetainDataIn[i] = spi_output[33 + i];
 	}
 
 	return 0;
